@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minimal Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        button {
+            padding: 10px;
+            margin: 10px 0;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            min-height: 100px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Minimal Test Page</h1>
+    <p>This is a minimal test page to check if the API is working.</p>
+    
+    <button id="check-health">Check API Health</button>
+    <div id="result">Results will appear here...</div>
+    
+    <script>
+        // Very minimal JavaScript
+        document.getElementById('check-health').addEventListener('click', function() {
+            document.getElementById('result').textContent = 'Checking API health...';
+            
+            fetch('http://localhost:5000/api/health')
+                .then(function(response) { return response.json(); })
+                .then(function(data) {
+                    document.getElementById('result').textContent = 'API Status: ' + 
+                        data.status + ' - ' + data.message;
+                })
+                .catch(function(error) {
+                    document.getElementById('result').textContent = 'Error: ' + error.message;
+                });
+        });
+    </script>
+</body>
+</html> 

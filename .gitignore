@@ -1,0 +1,80 @@
+# Exclude translational-layer directory
+translational-layer-1.5B/
+
+# Exclude embedded git repository (old codebase)
+Holowellness_Chatbot_version_1.0/
+
+# Exclude large test images
+Posture_Analysis_Test/*.png
+
+# Exclude other non-essential directories
+deepagents-0.2.8/
+PostureAnalysisDocs/
+
+# Exclude temporary and test files
+*.txt
+tmp_chat.json
+test-payload.json
+*.docx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.log
+local_settings.py
+db.sqlite3
+instance/
+.webassets-cache
+.env
+venv/
+ENV/
+env/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+dist-ssr/
+*.local
+.npm
+.eslintcache
+.node_repl_history
+*.tgz
+.yarn-integrity
+.cache/
+bun.lockb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# SSH Keys
+*.pem
+*.pub
+holowellness-ec2-key*

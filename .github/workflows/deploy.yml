@@ -1,0 +1,869 @@
+name: Deploy HoloWellness Chatbot to AWS
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+        
+    - name: Install frontend dependencies
+      run: |
+        npm install
+        
+    - name: Build frontend
+      run: |
+        npm run build
+        
+    - name: Verify backend files
+      run: |
+        # Skip local pip install - dependencies are installed on EC2 during deployment
+        # This saves time and avoids disk space issues on GitHub Actions runner
+        echo "✅ Skipping local backend dependency installation (handled on EC2)"
+        echo "📁 Verifying backend files exist:"
+        ls -la backend/
+        test -f backend/app.py && echo "✅ app.py found"
+        test -f backend/requirements-prod.txt && echo "✅ requirements-prod.txt found"
+        
+    - name: Create deployment package
+      run: |
+        # Create deployment directory
+        mkdir -p deployment
+        
+        # Copy backend files
+        cp -r backend/* deployment/
+        
+        # Copy environment files if they exist
+        [ -f ".env.production" ] && cp .env.production deployment/ || echo "⚠️  .env.production not found"
+        [ -f ".env.example" ] && cp .env.example deployment/ || echo "⚠️  .env.example not found"
+        
+        # Copy built frontend to backend static folder
+        mkdir -p deployment/static
+        if [ -d "dist" ] && [ "$(ls -A dist)" ]; then
+          echo "✅ Copying frontend build files from dist/ to deployment/static/"
+          cp -r dist/* deployment/static/
+          echo "📁 Frontend files copied:"
+          ls -la deployment/static/
+        else
+          echo "❌ Error: dist/ folder is empty or doesn't exist after build"
+          echo "🔍 Checking build output:"
+          ls -la dist/ || echo "dist/ folder does not exist"
+          exit 1
+        fi
+        
+        # Copy deployment scripts
+        cp -r deploy deployment/
+        
+        # Create deployment archive
+        cd deployment
+        tar -czf ../holowellness-deployment.tar.gz .
+        
+    # Deploy Lambda function for RAG indexing
+    - name: Build Lambda deployment package
+      run: |
+        echo "🔧 Building Lambda deployment package for RAG indexing..."
+        cd lambda
+        
+        # Create package directory
+        mkdir -p package
+        
+        # Install Lambda dependencies (try platform-specific first, fallback to normal install)
+        echo "📦 Installing Lambda dependencies..."
+        if ! pip install -r requirements.txt -t package/ \
+          --no-cache-dir \
+          --platform linux_x86_64 \
+          --only-binary=:all:; then
+          echo "⚠️ Platform-specific install failed, trying standard install..."
+          pip install -r requirements.txt -t package/ --no-cache-dir
+        fi
+        
+        # Copy Lambda source code
+        echo "📋 Copying Lambda source code..."
+        cp rag_indexer.py package/
+        
+        # Copy shared modules from backend (if they exist)
+        cp ../backend/enhanced_rag_qwen.py package/ 2>/dev/null || echo "⚠️  enhanced_rag_qwen.py not found, continuing..."
+        cp ../backend/s3_cache.py package/ 2>/dev/null || echo "⚠️  s3_cache.py not found, continuing..."
+        
+        # Aggressive package size optimization for Lambda 50MB limit
+        echo "🧹 Aggressively optimizing package size..."
+        
+        # Remove test files and documentation
+        find package/ -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+        find package/ -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+        find package/ -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+        find package/ -name "*.pyc" -delete 2>/dev/null || true
+        find package/ -name "*.pyo" -delete 2>/dev/null || true
+        find package/ -name "*.pyd" -delete 2>/dev/null || true
+        
+        # Remove documentation and examples
+        rm -rf package/*/examples/ 2>/dev/null || true
+        rm -rf package/*/docs/ 2>/dev/null || true
+        rm -rf package/*/doc/ 2>/dev/null || true
+        rm -rf package/*/*.egg-info/ 2>/dev/null || true
+        rm -rf package/*/LICENSE* 2>/dev/null || true
+        rm -rf package/*/README* 2>/dev/null || true
+        
+        # Remove large unnecessary scipy/sklearn components
+        rm -rf package/scipy/sparse/linalg/dsolve/SuperLU/ 2>/dev/null || true
+        rm -rf package/scipy/sparse/linalg/eigen/arpack/ 2>/dev/null || true
+        rm -rf package/sklearn/datasets/data/ 2>/dev/null || true
+        rm -rf package/sklearn/datasets/descr/ 2>/dev/null || true
+        rm -rf package/sklearn/datasets/images/ 2>/dev/null || true
+        
+        # Remove .so files we don't need (keep only essential ones)
+        find package/ -name "*.so" -size +5M -delete 2>/dev/null || true
+        
+        # Check package size
+        PACKAGE_SIZE_MB=$(du -sm package/ | cut -f1)
+        echo "📦 Package size after optimization: ${PACKAGE_SIZE_MB}MB"
+        
+        if [ "$PACKAGE_SIZE_MB" -gt 50 ]; then
+          echo "⚠️ Package still too large, applying extreme optimization..."
+          # Remove more unnecessary components if still too large
+          rm -rf package/scipy/optimize/ 2>/dev/null || true
+          rm -rf package/scipy/stats/ 2>/dev/null || true
+          rm -rf package/sklearn/ensemble/ 2>/dev/null || true
+          rm -rf package/sklearn/neural_network/ 2>/dev/null || true
+          
+          # Final size check
+          PACKAGE_SIZE_MB=$(du -sm package/ | cut -f1)
+          echo "📦 Final package size: ${PACKAGE_SIZE_MB}MB"
+        fi
+        
+        # Create deployment package
+        echo "📦 Creating deployment ZIP..."
+        cd package
+        zip -r ../rag_indexer.zip . -x "*.DS_Store*" "*.git*"
+        cd ..
+        
+        # Display package info
+        PACKAGE_SIZE=$(ls -lh rag_indexer.zip | awk '{print $5}')
+        echo "✅ Lambda package created: rag_indexer.zip ($PACKAGE_SIZE)"
+        
+    - name: Deploy Lambda function
+      run: |
+        echo "🚀 Deploying Lambda function for RAG indexing..."
+        cd lambda
+        
+        FUNCTION_NAME="holowellness-rag-indexer"
+        
+        # Check if function exists
+        if aws lambda get-function --function-name $FUNCTION_NAME >/dev/null 2>&1; then
+          echo "🔄 Updating existing Lambda function..."
+          
+          # Update function code
+          aws lambda update-function-code \
+            --function-name $FUNCTION_NAME \
+            --zip-file fileb://rag_indexer.zip
+            
+          # Wait for code update to complete
+          echo "⏳ Waiting for function update to complete..."
+          aws lambda wait function-updated \
+            --function-name $FUNCTION_NAME
+            
+          # Update function configuration
+          aws lambda update-function-configuration \
+            --function-name $FUNCTION_NAME \
+            --memory-size 3008 \
+            --timeout 900 \
+            --environment Variables="{
+              S3_BUCKET=holowellness,
+              S3_PDFS_PREFIX=rag_pdfs/,
+              S3_CACHE_PREFIX=cache/current/,
+              BATCH_SIZE=3,
+              MAX_MEMORY_MB=2800
+            }"
+            
+        else
+          echo "🆕 Creating new Lambda function..."
+          
+          # Create IAM role if it doesn't exist
+          ROLE_NAME="holowellness-lambda-role"
+          if ! aws iam get-role --role-name $ROLE_NAME >/dev/null 2>&1; then
+            echo "🔐 Creating IAM role for Lambda..."
+            
+            # Create trust policy
+            cat > trust-policy.json << 'TRUST_POLICY'
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "lambda.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole"
+                }
+            ]
+        }
+        TRUST_POLICY
+        
+            # Create execution policy
+            cat > execution-policy.json << 'EXEC_POLICY'
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                    ],
+                    "Resource": "arn:aws:logs:*:*:*"
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:PutObject",
+                        "s3:ListBucket"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::holowellness",
+                        "arn:aws:s3:::holowellness/*"
+                    ]
+                },
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "xray:PutTraceSegments",
+                        "xray:PutTelemetryRecords"
+                    ],
+                    "Resource": "*"
+                }
+            ]
+        }
+        EXEC_POLICY
+        
+            # Create role
+            aws iam create-role \
+              --role-name $ROLE_NAME \
+              --assume-role-policy-document file://trust-policy.json
+              
+            # Attach policies
+            aws iam put-role-policy \
+              --role-name $ROLE_NAME \
+              --policy-name "${ROLE_NAME}-execution-policy" \
+              --policy-document file://execution-policy.json
+              
+            # Wait for role to be ready
+            echo "⏳ Waiting for IAM role to be ready..."
+            sleep 15
+          fi
+          
+          # Get role ARN
+          ROLE_ARN=$(aws iam get-role --role-name $ROLE_NAME --query 'Role.Arn' --output text)
+          
+          # Create function
+          aws lambda create-function \
+            --function-name $FUNCTION_NAME \
+            --runtime python3.9 \
+            --role $ROLE_ARN \
+            --handler rag_indexer.lambda_handler \
+            --zip-file fileb://rag_indexer.zip \
+            --memory-size 3008 \
+            --timeout 900 \
+            --environment Variables="{
+              S3_BUCKET=holowellness,
+              S3_PDFS_PREFIX=rag_pdfs/,
+              S3_CACHE_PREFIX=cache/current/,
+              BATCH_SIZE=3,
+              MAX_MEMORY_MB=2800
+            }" \
+            --tracing-config Mode=Active
+        fi
+        
+        # Wait for final configuration to be active
+        echo "⏳ Waiting for Lambda function to be ready..."
+        aws lambda wait function-updated \
+          --function-name $FUNCTION_NAME
+        
+        echo "✅ Lambda function deployed successfully!"
+        
+        # Test the function
+        echo "Testing Lambda function..."
+        # Create clean UTF-8 JSON payload without BOM using hex approach
+        echo -ne '\x7b\x22\x74\x65\x73\x74\x22\x3a\x20\x74\x72\x75\x65\x7d' > test-payload.json
+        
+        # Verify payload with hex dump to check encoding
+        echo "Payload hex dump:"
+        xxd test-payload.json || hexdump -C test-payload.json || od -t x1 test-payload.json
+        
+        aws lambda invoke \
+          --function-name $FUNCTION_NAME \
+          --payload fileb://test-payload.json \
+          lambda-response.json
+          
+        echo "📋 Lambda response:"
+        cat lambda-response.json || echo "No response file"
+        
+    # Removed S3 upload to avoid /tmp space issues on EC2 and simplify deploy
+    
+    - name: Resolve EC2 instance (reuse existing)
+      id: resolve-ec2
+      run: |
+        set -e
+        ID="${EC2_INSTANCE_ID}"
+        if [ -z "$ID" ] || [ "$ID" = "null" ]; then
+          # Fallback: find by Name tag
+          ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=HoloWellness-Server" "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
+        fi
+        if [ -z "$ID" ]; then
+          echo "No target EC2 instance found. Set repository variable EC2_INSTANCE_ID or tag an instance Name=HoloWellness-Server" >&2
+          exit 1
+        fi
+        # Ensure instance is running
+        aws ec2 start-instances --instance-ids "$ID" >/dev/null || true
+        aws ec2 wait instance-running --instance-ids "$ID"
+        
+        AZ=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+        IP=$(aws ec2 describe-instances --instance-ids "$ID" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+        echo "INSTANCE_ID=$ID" >> $GITHUB_ENV
+        echo "PUBLIC_IP=$IP" >> $GITHUB_ENV
+        echo "AVAILABILITY_ZONE=$AZ" >> $GITHUB_ENV
+        echo "instance-ip=$IP" >> $GITHUB_OUTPUT
+        echo "instance-id=$ID" >> $GITHUB_OUTPUT
+
+    - name: Push ephemeral SSH key (EC2 Instance Connect)
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        sudo apt-get update && sudo apt-get install -y openssh-client
+        ssh-keygen -t rsa -b 4096 -f ~/.ssh/holowellness -N "" <<< y
+        aws ec2-instance-connect send-ssh-public-key \
+          --instance-id "${INSTANCE_ID}" --availability-zone "${AVAILABILITY_ZONE}" \
+          --instance-os-user ubuntu \
+          --ssh-public-key file://~/.ssh/holowellness.pub
+
+    - name: Deploy Application via EC2 Instance Connect
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        # Create deployment script for remote execution
+        cat > remote-deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        # Deployment package is uploaded via SCP to /home/ubuntu
+        PKG=/home/ubuntu/holowellness-deployment.tar.gz
+        if [ ! -f "$PKG" ]; then
+            echo "❌ Deployment package not found at $PKG"; exit 1
+        fi
+
+        # Extract to application directory
+        sudo mkdir -p /opt/holowellness
+        sudo tar -xzf "$PKG" -C /opt/holowellness
+        sudo chown -R ubuntu:ubuntu /opt/holowellness
+        # Remove package to free disk space
+        rm -f "$PKG" || true
+        
+        # Run application deployment (skip repository cloning since we already have the files)
+        cd /opt/holowellness
+        
+        # Debug: Check what files are available
+        echo "📦 Step 1: Repository files already available from deployment package ✅"
+        echo "🔍 Debug: Contents of /opt/holowellness:"
+        ls -la
+        echo ""
+        
+        # Ensure we're in the right directory
+        echo "🐍 Step 2: Setting up Python Environment..."
+        echo "📁 Current directory: $(pwd)"
+        
+        # Backend files are directly in /opt/holowellness (not in a backend subdirectory)
+        echo "✅ Backend files found directly in /opt/holowellness"
+        
+        # Create virtual environment in the main directory (reset any old venv)
+        rm -rf venv || true
+        python3 -m venv venv
+        source venv/bin/activate
+        
+        # AGGRESSIVE disk cleanup before installation
+        echo "🧹 Aggressive disk cleanup..."
+        df -h
+        # Clean package manager caches
+        sudo apt-get clean || true
+        sudo apt-get autoclean || true
+        sudo rm -rf /var/cache/apt/archives/* || true
+        sudo rm -rf /var/lib/apt/lists/* || true
+        # Clean logs
+        sudo journalctl --vacuum-size=10M || true
+        sudo rm -rf /var/log/*.gz /var/log/*.1 /var/log/*.old || true
+        # Clean pip and build caches
+        rm -rf ~/.cache/pip ~/.cache/huggingface ~/.cache/torch || true
+        sudo rm -rf /root/.cache/pip /root/.cache/huggingface /root/.cache/torch || true
+        # Clean old Python packages
+        sudo rm -rf /usr/local/lib/python3.*/dist-packages/* || true
+        # Clean tmp
+        sudo rm -rf /tmp/* /var/tmp/* || true
+        # Clean old docker if present
+        sudo docker system prune -af || true
+        echo "After cleanup:"
+        df -h
+        
+        # Install production dependencies with CPU-only PyTorch
+        # Minimize disk usage during installation
+        export PIP_NO_CACHE_DIR=1
+        export PIP_NO_WARN_SCRIPT_LOCATION=0
+        export TMPDIR=/opt/holowellness/tmp
+        mkdir -p "$TMPDIR"
+        
+        # Upgrade pip first (minimal)
+        pip install --no-cache-dir --upgrade pip setuptools wheel
+        
+        # Install PyTorch CPU-only FIRST (this is the largest package)
+        echo "📦 Installing PyTorch CPU-only..."
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+        
+        # Clean up after torch install
+        rm -rf ~/.cache/pip "$TMPDIR"/* || true
+        df -h
+        
+        # Install other requirements WITHOUT torch (it's already installed)
+        echo "📦 Installing other dependencies..."
+        pip install --no-cache-dir -r requirements-prod.txt
+        
+        # Final cleanup
+        rm -rf ~/.cache/pip ~/.cache/huggingface "$TMPDIR"/* || true
+        sudo rm -rf /root/.cache/pip /root/.cache/huggingface || true
+        
+        echo "✅ Installation complete"
+        df -h
+        
+        echo "   ✅ Python environment ready"
+        
+        # Configure environment from GitHub Secrets/Vars → write to /opt/holowellness/.env
+        echo ""
+        echo "⚙️  Step 3: Configuring Environment (.env from GitHub secrets/vars)..."
+        PUBIP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+        [ -z "$PUBIP" ] && PUBIP="127.0.0.1"
+        OPENROUTER_MODEL_VAL="${{ vars.OPENROUTER_MODEL }}"
+        [ -z "$OPENROUTER_MODEL_VAL" ] && OPENROUTER_MODEL_VAL="deepseek/deepseek-r1-distill-qwen-14b"
+        CORS_EXTRA="${{ vars.CORS_EXTRA_ORIGINS }}"
+        [ -n "$CORS_EXTRA" ] && CORS_EXTRA=",$CORS_EXTRA"
+        SECRET_VAL="${{ secrets.SECRET_KEY }}"
+        [ -z "$SECRET_VAL" ] && SECRET_VAL="holowellness-production-secret-key-2024"
+        # Mitigation tuning via repo variables with safe defaults
+        OPENROUTER_RETRIES_VAL="${{ vars.OPENROUTER_RETRIES }}"
+        [ -z "$OPENROUTER_RETRIES_VAL" ] && OPENROUTER_RETRIES_VAL="5"
+        OPENROUTER_BACKOFF_VAL="${{ vars.OPENROUTER_BACKOFF_MS }}"
+        [ -z "$OPENROUTER_BACKOFF_VAL" ] && OPENROUTER_BACKOFF_VAL="1500"
+        OPENROUTER_TIMEOUT_VAL="${{ vars.OPENROUTER_TIMEOUT }}"
+        [ -z "$OPENROUTER_TIMEOUT_VAL" ] && OPENROUTER_TIMEOUT_VAL="60"
+        OPENROUTER_MAX_TOKENS_VAL="${{ vars.OPENROUTER_MAX_TOKENS }}"
+        [ -z "$OPENROUTER_MAX_TOKENS_VAL" ] && OPENROUTER_MAX_TOKENS_VAL="1000"
+        DISABLE_RERANKER_VAL="${{ vars.DISABLE_RERANKER }}"
+        [ -z "$DISABLE_RERANKER_VAL" ] && DISABLE_RERANKER_VAL="false"
+        RAG_TIMEOUT_SECONDS_VAL="${{ vars.RAG_TIMEOUT_SECONDS }}"
+        [ -z "$RAG_TIMEOUT_SECONDS_VAL" ] && RAG_TIMEOUT_SECONDS_VAL="45"
+
+        # RAG token budgets (prefer repo vars; fallback to secrets; then defaults)
+        RAG_GENERATION_MAX_TOKENS_VAL="${{ vars.RAG_GENERATION_MAX_TOKENS }}"
+        [ -z "$RAG_GENERATION_MAX_TOKENS_VAL" ] && RAG_GENERATION_MAX_TOKENS_VAL="${{ secrets.RAG_GENERATION_MAX_TOKENS }}"
+        [ -z "$RAG_GENERATION_MAX_TOKENS_VAL" ] && RAG_GENERATION_MAX_TOKENS_VAL="600"
+        RAG_TRANSLATION_MAX_TOKENS_VAL="${{ vars.RAG_TRANSLATION_MAX_TOKENS }}"
+        [ -z "$RAG_TRANSLATION_MAX_TOKENS_VAL" ] && RAG_TRANSLATION_MAX_TOKENS_VAL="${{ secrets.RAG_TRANSLATION_MAX_TOKENS }}"
+        [ -z "$RAG_TRANSLATION_MAX_TOKENS_VAL" ] && RAG_TRANSLATION_MAX_TOKENS_VAL="1200"
+
+        # RAG S3 source (optional overrides)
+        RAG_S3_BUCKET_VAL="${{ vars.RAG_S3_BUCKET }}"
+        [ -z "$RAG_S3_BUCKET_VAL" ] && RAG_S3_BUCKET_VAL="${{ secrets.RAG_S3_BUCKET }}"
+        [ -z "$RAG_S3_BUCKET_VAL" ] && RAG_S3_BUCKET_VAL="holowellness"
+        RAG_S3_PREFIX_VAL="${{ vars.RAG_S3_PREFIX }}"
+        [ -z "$RAG_S3_PREFIX_VAL" ] && RAG_S3_PREFIX_VAL="${{ secrets.RAG_S3_PREFIX }}"
+        [ -z "$RAG_S3_PREFIX_VAL" ] && RAG_S3_PREFIX_VAL="rag_pdfs/"
+
+        # S3 cache bucket/prefix (optional, falls back to RAG bucket)
+        S3_CACHE_BUCKET_VAL="${{ vars.S3_CACHE_BUCKET }}"
+        [ -z "$S3_CACHE_BUCKET_VAL" ] && S3_CACHE_BUCKET_VAL="$RAG_S3_BUCKET_VAL"
+        S3_CACHE_PREFIX_VAL="${{ vars.S3_CACHE_PREFIX }}"
+        [ -z "$S3_CACHE_PREFIX_VAL" ] && S3_CACHE_PREFIX_VAL="cache/current/"
+        S3_CACHE_DELETE_LOCAL_VAL="${{ vars.S3_CACHE_DELETE_LOCAL }}"
+        [ -z "$S3_CACHE_DELETE_LOCAL_VAL" ] && S3_CACHE_DELETE_LOCAL_VAL="true"
+
+        # RAG ingestion limits
+        RAG_MAX_CHUNKS_VAL="${{ vars.RAG_MAX_CHUNKS }}"
+        [ -z "$RAG_MAX_CHUNKS_VAL" ] && RAG_MAX_CHUNKS_VAL="${{ secrets.RAG_MAX_CHUNKS }}"
+        [ -z "$RAG_MAX_CHUNKS_VAL" ] && RAG_MAX_CHUNKS_VAL="3000"
+
+        sudo tee /opt/holowellness/.env >/dev/null <<ENVEOF
+        FLASK_ENV=production
+        DEBUG=False
+        SECRET_KEY="${SECRET_VAL}"
+        CORS_ORIGINS="http://${PUBIP},http://localhost:3000${CORS_EXTRA}"
+
+        OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
+        OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
+        OPENROUTER_MODEL="${OPENROUTER_MODEL_VAL}"
+        OPENROUTER_MAX_TOKENS="$OPENROUTER_MAX_TOKENS_VAL"
+        OPENROUTER_RETRIES="$OPENROUTER_RETRIES_VAL"
+        OPENROUTER_BACKOFF_MS="$OPENROUTER_BACKOFF_VAL"
+        OPENROUTER_TIMEOUT="$OPENROUTER_TIMEOUT_VAL"
+        DISABLE_RERANKER="$DISABLE_RERANKER_VAL"
+        RAG_TIMEOUT_SECONDS="$RAG_TIMEOUT_SECONDS_VAL"
+        RAG_GENERATION_MAX_TOKENS="$RAG_GENERATION_MAX_TOKENS_VAL"
+        RAG_TRANSLATION_MAX_TOKENS="$RAG_TRANSLATION_MAX_TOKENS_VAL"
+        RAG_S3_BUCKET="$RAG_S3_BUCKET_VAL"
+        RAG_S3_PREFIX="$RAG_S3_PREFIX_VAL"
+        RAG_MAX_CHUNKS="$RAG_MAX_CHUNKS_VAL"
+        RAG_SYNC_ON_START=false
+        APP_PUBLIC_URL="http://${PUBIP}"
+        APP_TITLE="HoloWellness Chatbot"
+        S3_CACHE_BUCKET="$S3_CACHE_BUCKET_VAL"
+        S3_CACHE_PREFIX="$S3_CACHE_PREFIX_VAL"
+        S3_CACHE_DELETE_LOCAL="$S3_CACHE_DELETE_LOCAL_VAL"
+
+        MONGO_URI="${{ secrets.MONGO_URI }}"
+        AWS_REGION="${{ secrets.AWS_REGION }}"
+
+        LOG_LEVEL=INFO
+        CACHE_TTL=3600
+        MAX_CACHE_SIZE=1000
+        DEFAULT_CHATBOT_ID=507f1f77bcf86cd799439011
+        ENVEOF
+        # Normalize: strip any leading spaces introduced by YAML indentation
+        sudo sed -i 's/^\s\+//' /opt/holowellness/.env
+
+        # Continue with the rest of the deployment
+        cd /opt/holowellness
+        export FLASK_ENV=production
+        export OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
+        export MONGO_URI="${{ secrets.MONGO_URI }}"
+        export OPENROUTER_MODEL="$OPENROUTER_MODEL_VAL"
+        export APP_PUBLIC_URL="http://${PUBIP}"
+        export APP_TITLE="HoloWellness Chatbot"
+        
+        # Start the Flask application with gunicorn (production WSGI server)
+        echo "🚀 Starting Flask application with Gunicorn..."
+        
+        # Ensure we're in the correct directory
+        cd /opt/holowellness
+        
+        # Set environment variables for the app
+        export FLASK_ENV=production
+        export OPENROUTER_API_KEY="${{ secrets.OPENROUTER_API_KEY }}"
+        export MONGO_URI="${{ secrets.MONGO_URI }}"
+        export PYTHONPATH="/opt/holowellness:$PYTHONPATH"
+        export APP_PUBLIC_URL="http://${PUBIP}"
+        export APP_TITLE="HoloWellness Chatbot"
+        
+        # Kill any existing processes on port 5000 (use 5000 instead of 80 to avoid permission issues)
+        sudo fuser -k 5000/tcp || true
+        
+        # Create a gunicorn config for better logging
+        cat > gunicorn.conf.py << 'GUNICORN_CONFIG'
+        bind = "0.0.0.0:5000"
+        workers = 1
+        threads = 1
+        # Increase timeout to accommodate slower CPU inference
+        timeout = 300
+        graceful_timeout = 300
+        keepalive = 5
+        max_requests = 1000
+        max_requests_jitter = 100
+        preload_app = False
+        daemon = False
+        user = "ubuntu"
+        group = "ubuntu"
+        accesslog = "/opt/holowellness/gunicorn-access.log"
+        errorlog = "/opt/holowellness/gunicorn-error.log"
+        loglevel = "info"
+        GUNICORN_CONFIG
+        
+        # Create systemd service for Gunicorn (ensures restart and boot persistence)
+        sudo tee /etc/systemd/system/holowellness.service >/dev/null <<'UNITEOF'
+        [Unit]
+        Description=HoloWellness Gunicorn Service
+        After=network-online.target
+        Wants=network-online.target
+
+        [Service]
+        User=ubuntu
+        Group=ubuntu
+        WorkingDirectory=/opt/holowellness
+        EnvironmentFile=-/opt/holowellness/.env
+        ExecStart=/opt/holowellness/venv/bin/gunicorn --config /opt/holowellness/gunicorn.conf.py app:app
+        Restart=always
+        RestartSec=5
+        TimeoutSec=300
+        KillSignal=SIGQUIT
+        Type=simple
+
+        [Install]
+        WantedBy=multi-user.target
+        UNITEOF
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable holowellness
+        sudo systemctl restart holowellness
+
+        # Add small swapfile to reduce OOM risk on small instances
+        if ! sudo swapon --show | grep -q "/swapfile"; then
+          echo "📦 Adding 1G swapfile to improve stability on small instances"
+          sudo fallocate -l 1G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=1024
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          if ! grep -q "/swapfile" /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+          fi
+        fi
+        
+        echo "⏳ Waiting for application to start..."
+        sleep 20
+        
+        # Check if application is running on port 5000
+        if curl -f http://localhost:5000/health > /dev/null 2>&1; then
+            echo "✅ Flask application started successfully on port 5000!"
+            
+            # Get public IP
+            PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+            
+            # Configure simple nginx proxy to forward port 80 to 5000 (no heredoc to avoid YAML issues)
+            if ! command -v nginx >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y nginx
+            fi
+            printf '%s\n' \
+              'server {' \
+              '    listen 80;' \
+              '    server_name _;' \
+              '' \
+              '    # Increase timeouts for upstream to avoid 502 on slow responses' \
+              '    proxy_connect_timeout 15s;' \
+              '    proxy_send_timeout 310s;' \
+              '    proxy_read_timeout 310s;' \
+              '    send_timeout 310s;' \
+              '    client_max_body_size 10m;' \
+              '' \
+              '    location / {' \
+              '        proxy_pass http://127.0.0.1:5000;' \
+              '        proxy_set_header Host $host;' \
+              '        proxy_set_header X-Real-IP $remote_addr;' \
+              '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
+              '        proxy_set_header X-Forwarded-Proto $scheme;' \
+              '        proxy_http_version 1.1;' \
+              '        proxy_set_header Connection "";' \
+              '        proxy_buffering off;' \
+              '        proxy_request_buffering off;' \
+              '        proxy_ignore_client_abort off;' \
+              '    }' \
+              '}' | sudo tee /etc/nginx/sites-available/holowellness > /dev/null
+            
+            # Enable the site and restart nginx
+            sudo ln -sf /etc/nginx/sites-available/holowellness /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
+            sudo systemctl enable nginx
+            sudo systemctl restart nginx
+            
+            echo "🌐 Application accessible at: http://$PUBLIC_IP/"
+            echo "🤖 API endpoint: http://$PUBLIC_IP/api/chat"
+            echo "📊 Health check: http://$PUBLIC_IP/health"
+        else
+            echo "❌ Flask application failed to start or not accessible"
+            echo "🔍 Gunicorn error log:"
+            sudo tail -n 200 /opt/holowellness/gunicorn-error.log || echo "No error log found"
+            echo "🔍 Checking process status:"
+            ps aux | grep gunicorn || echo "No gunicorn processes found"
+            echo "🔍 Checking port 5000:"
+            ss -tlnp | grep :5000 || echo "Nothing listening on port 5000"
+            exit 1
+        fi
+        
+        echo "   ✅ Application started successfully"
+        EOF
+        
+        # Pre-clean remote disk to ensure enough free space
+        ssh -i ~/.ssh/holowellness -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP} '
+          set -euo pipefail
+          echo "🔧 AGGRESSIVE Pre-clean on remote to free disk..."
+          df -h || true
+          
+          # Remove old deployment package
+          sudo rm -f /home/ubuntu/holowellness-deployment.tar.gz || true
+          
+          # Remove previous deployment completely
+          sudo rm -rf /opt/holowellness || true
+          sudo mkdir -p /opt/holowellness
+          sudo chown ubuntu:ubuntu /opt/holowellness
+          
+          # Clean package manager
+          sudo apt-get clean || true
+          sudo apt-get autoclean || true
+          sudo rm -rf /var/cache/apt/archives/* || true
+          sudo rm -rf /var/lib/apt/lists/* || true
+          
+          # Clean logs aggressively
+          sudo journalctl --vacuum-size=10M || true
+          sudo rm -rf /var/log/*.gz /var/log/*.1 /var/log/*.old || true
+          sudo truncate -s 0 /var/log/syslog || true
+          sudo truncate -s 0 /var/log/kern.log || true
+          
+          # Clean all caches
+          rm -rf ~/.cache/* || true
+          sudo rm -rf /root/.cache/* || true
+          sudo rm -rf /tmp/* /var/tmp/* || true
+          
+          # Clean old Python packages
+          sudo rm -rf /usr/local/lib/python3.*/dist-packages/* || true
+          
+          # Clean Docker if present
+          sudo docker system prune -af 2>/dev/null || true
+          
+          # Clean snap cache if present
+          sudo rm -rf /var/lib/snapd/cache/* || true
+          
+          echo "After cleanup:"
+          df -h || true
+        '
+
+        # Copy package and deployment script to remote host using EIC key
+        scp -i ~/.ssh/holowellness -o StrictHostKeyChecking=no holowellness-deployment.tar.gz ubuntu@${PUBLIC_IP}:/home/ubuntu/holowellness-deployment.tar.gz
+        scp -i ~/.ssh/holowellness -o StrictHostKeyChecking=no remote-deploy.sh ubuntu@${PUBLIC_IP}:/tmp/
+        ssh -i ~/.ssh/holowellness -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP} "chmod +x /tmp/remote-deploy.sh && /tmp/remote-deploy.sh"
+    
+    - name: Health Check
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        # Wait for application to start
+        sleep 30
+        
+        # Test health endpoint
+        HEALTH_URL="http://${PUBLIC_IP}/health"
+        echo "Testing health endpoint: $HEALTH_URL"
+        
+        for i in {1..10}; do
+          if curl -f $HEALTH_URL; then
+            echo "✅ Health check passed!"
+            break
+          else
+            echo "⏳ Waiting for application to start... (attempt $i/10)"
+            sleep 30
+          fi
+        done
+
+    - name: Post-deploy RAG Reindex
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        set -e
+        sudo apt-get update && sudo apt-get install -y jq >/dev/null 2>&1 || true
+        REINDEX_URL="http://${PUBLIC_IP}/api/rag/reindex"
+        STATUS_URL="http://${PUBLIC_IP}/api/rag/status"
+        echo "🔁 Triggering RAG reindex: $REINDEX_URL"
+        # Trigger reindex (best-effort; don't fail the workflow if it times out)
+        curl -s -X POST "$REINDEX_URL" || true
+        echo "⏳ Waiting for reindex to complete..."
+        # Poll status a few times
+        for i in {1..10}; do
+          sleep 6
+          RESP=$(curl -s "$STATUS_URL" || true)
+          echo "RAG status (attempt $i): $RESP"
+          if command -v jq >/dev/null 2>&1; then
+            DOCS=$(echo "$RESP" | jq -r '.documents_indexed // 0' 2>/dev/null || echo 0)
+          else
+            DOCS=0
+          fi
+          if [ "$DOCS" != "null" ] && [ "$DOCS" -gt 0 ]; then
+            echo "✅ RAG indexed $DOCS documents"
+            break
+          fi
+        done
+    
+    - name: API Smoke Test
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        CHAT_URL="http://${PUBLIC_IP}/api/chat"
+        echo "Testing API endpoint: $CHAT_URL"
+        curl -s -H 'Content-Type: application/json' --data '{"query":"hello"}' "$CHAT_URL" || true
+
+    - name: Refresh EC2 Instance Connect key (for diagnostics)
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        # Re-send ephemeral SSH public key as EIC keys expire quickly
+        aws ec2-instance-connect send-ssh-public-key \
+          --instance-id "${INSTANCE_ID}" \
+          --availability-zone "${AVAILABILITY_ZONE}" \
+          --instance-os-user ubuntu \
+          --ssh-public-key file://~/.ssh/holowellness.pub
+
+    - name: Collect remote diagnostics and logs
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        mkdir -p logs
+        ssh -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP} '
+          set -euo pipefail
+          sudo tail -n 200 /var/log/nginx/error.log > /tmp/nginx-error.log || true
+          sudo tail -n 200 /var/log/nginx/access.log > /tmp/nginx-access.log || true
+          tail -n 400 /opt/holowellness/gunicorn-error.log > /tmp/gunicorn-error.log || true
+          ss -tlnp | grep :5000 > /tmp/ss-5000.txt || true
+          ps aux | grep gunicorn > /tmp/ps-gunicorn.txt || true
+          curl -s -i http://127.0.0.1:5000/health > /tmp/local-health.txt || true
+        '
+        scp -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP}:/tmp/nginx-error.log logs/ || true
+        scp -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP}:/tmp/nginx-access.log logs/ || true
+        scp -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP}:/tmp/gunicorn-error.log logs/ || true
+        scp -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP}:/tmp/ss-5000.txt logs/ || true
+        scp -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP}:/tmp/ps-gunicorn.txt logs/ || true
+        scp -i ~/.ssh/holowellness -o IdentitiesOnly=yes -o StrictHostKeyChecking=no ubuntu@${PUBLIC_IP}:/tmp/local-health.txt logs/ || true
+
+    - name: Upload diagnostics logs
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: diagnostics-logs
+        path: logs/
+        
+    - name: Deployment Summary
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      run: |
+        echo "🎉 Deployment completed successfully!"
+        echo "📍 Instance IP: ${PUBLIC_IP}"
+        echo "🔗 Health Check: http://${PUBLIC_IP}/health"
+        echo "🤖 API Endpoint: http://${PUBLIC_IP}/api/chat"
+        echo "🌐 Application: http://${PUBLIC_IP}/"
+        
+        # Save deployment info as artifact
+        cat > deployment-info.txt << EOF
+        Instance IP: ${PUBLIC_IP}
+        Instance ID: ${INSTANCE_ID}
+        Health Check: http://${PUBLIC_IP}/health
+        API Endpoint: http://${PUBLIC_IP}/api/chat
+        Application URL: http://${PUBLIC_IP}/
+        Deployment Time: $(date)
+        EOF
+        
+    - name: Upload deployment info
+      if: steps.resolve-ec2.outputs.instance-ip != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-info
+        path: deployment-info.txt

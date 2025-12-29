@@ -1,0 +1,18 @@
+[Unit]
+Description=Gemma RAG Microservice
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/gemma-rag
+EnvironmentFile=/opt/gemma-rag/.env
+ExecStart=/opt/gemma-rag/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 9000 --workers 1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+
